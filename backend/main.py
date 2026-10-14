@@ -27,10 +27,11 @@ FRONTEND_PATH = PROJECT_ROOT / "frontend"
 CITY_CACHE = {}
 FORECAST_CACHE = {}
 CACHE_TTL_SECONDS = 900
+STALE_CACHE_TTL_SECONDS = 86400
 
 
 def fetch_with_retry(url, params=None, timeout=20):
-    """Retry weather/geocoding API calls when the provider rate-limits us."""
+    """Retry transient failures, but do not amplify provider rate limits."""
     params = params or {}
     last_error = None
 
@@ -38,17 +39,19 @@ def fetch_with_retry(url, params=None, timeout=20):
         try:
             response = requests.get(url, params=params, timeout=timeout)
             if response.status_code == 429:
-                last_error = RuntimeError("Open-Meteo rate limit reached")
-                if attempt < 3:
-                    time.sleep(2 ** attempt)
-                    continue
                 raise HTTPException(
                     status_code=429,
                     detail=(
-                        "The weather provider is rate-limiting requests. "
-                        "Please wait a moment and try again."
+                        "Open-Meteo has temporarily limited requests for this "
+                        "service. Please wait 15 minutes before trying again."
                     ),
-                ) from last_error
+                    headers={
+                        "Retry-After": response.headers.get(
+                            "Retry-After",
+                            "900",
+                        )
+                    },
+                )
 
             response.raise_for_status()
             return response
@@ -74,6 +77,65 @@ def fetch_with_retry(url, params=None, timeout=20):
         status_code=502,
         detail="The weather provider request failed after retries.",
     )
+
+
+def get_weather_forecast(location):
+    """Fetch one shared seven-day payload for the daily and weekly views."""
+    latitude = location["latitude"]
+    longitude = location["longitude"]
+    cache_key = (location["name"].casefold(), latitude, longitude)
+    now = time.time()
+    cached_forecast = FORECAST_CACHE.get(cache_key)
+
+    if cached_forecast is not None:
+        age = now - cached_forecast["saved_at"]
+        if age < CACHE_TTL_SECONDS:
+            return cached_forecast["data"]
+
+    try:
+        weather_response = fetch_with_retry(
+            WEATHER_URL,
+            params={
+                "latitude": latitude,
+                "longitude": longitude,
+                "current": (
+                    "temperature_2m,"
+                    "relative_humidity_2m,"
+                    "apparent_temperature,"
+                    "precipitation,"
+                    "rain,"
+                    "showers,"
+                    "weather_code,"
+                    "wind_speed_10m"
+                ),
+                "daily": (
+                    "precipitation_sum,"
+                    "precipitation_probability_max,"
+                    "temperature_2m_max,"
+                    "temperature_2m_min,"
+                    "weather_code"
+                ),
+                "timezone": "auto",
+                "forecast_days": 7,
+            },
+            timeout=20,
+        )
+        weather_data = weather_response.json()
+    except HTTPException:
+        if (
+            cached_forecast is not None
+            and now - cached_forecast["saved_at"] < STALE_CACHE_TTL_SECONDS
+        ):
+            return cached_forecast["data"]
+        raise
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="The weather service returned unexpected data.",
+        ) from exc
+
+    FORECAST_CACHE[cache_key] = {"data": weather_data, "saved_at": now}
+    return weather_data
 
 
 def describe_weather_code(code):
@@ -137,6 +199,13 @@ def find_punjab_city(city):
             timeout=15,
         )
         geo_data = geo_response.json()
+    except HTTPException:
+        if (
+            cached_result is not None
+            and time.time() - cached_result["saved_at"] < STALE_CACHE_TTL_SECONDS
+        ):
+            return cached_result["data"]
+        raise
     except ValueError as exc:
         raise HTTPException(
             status_code=502,
@@ -209,44 +278,8 @@ def predict_tomorrow(
         resolved_city = location["name"]
         country = location.get("country", "Unknown")
 
-        # STEP 2: Fetch the daily weather forecast
-        cache_key = (resolved_city.casefold(), latitude, longitude)
-        cached_forecast = FORECAST_CACHE.get(cache_key)
-        if cached_forecast is not None:
-            if time.time() - cached_forecast["saved_at"] < CACHE_TTL_SECONDS:
-                weather_data = cached_forecast["data"]
-            else:
-                FORECAST_CACHE.pop(cache_key, None)
-        else:
-            weather_response = fetch_with_retry(
-                WEATHER_URL,
-                params={
-                    "latitude": latitude,
-                    "longitude": longitude,
-                    "current": (
-                        "temperature_2m,"
-                        "relative_humidity_2m,"
-                        "apparent_temperature,"
-                        "precipitation,"
-                        "rain,"
-                        "showers,"
-                        "weather_code,"
-                        "wind_speed_10m"
-                    ),
-                    "daily": (
-                        "precipitation_sum,"
-                        "precipitation_probability_max,"
-                        "temperature_2m_max,"
-                        "temperature_2m_min,"
-                        "weather_code"
-                    ),
-                    "timezone": "auto",
-                    "forecast_days": 2,
-                },
-                timeout=20,
-            )
-            weather_data = weather_response.json()
-            FORECAST_CACHE[cache_key] = {"data": weather_data, "saved_at": time.time()}
+        # STEP 2: Reuse the same provider payload for daily and weekly views.
+        weather_data = get_weather_forecast(location)
 
     except HTTPException:
         raise
@@ -534,33 +567,8 @@ def predict_weekly(
         latitude = location["latitude"]
         longitude = location["longitude"]
 
-        cache_key = (location["name"].casefold(), latitude, longitude, "weekly")
-        cached_forecast = FORECAST_CACHE.get(cache_key)
-        if cached_forecast is not None:
-            if time.time() - cached_forecast["saved_at"] < CACHE_TTL_SECONDS:
-                weather_data = cached_forecast["data"]
-            else:
-                FORECAST_CACHE.pop(cache_key, None)
-        else:
-            weather_response = fetch_with_retry(
-                WEATHER_URL,
-                params={
-                    "latitude": latitude,
-                    "longitude": longitude,
-                    "daily": (
-                        "precipitation_sum,"
-                        "precipitation_probability_max,"
-                        "temperature_2m_max,"
-                        "temperature_2m_min,"
-                        "weather_code"
-                    ),
-                    "timezone": "auto",
-                    "forecast_days": 7,
-                },
-                timeout=20,
-            )
-            weather_data = weather_response.json()
-            FORECAST_CACHE[cache_key] = {"data": weather_data, "saved_at": time.time()}
+        # The main and weekly routes share the same cached provider payload.
+        weather_data = get_weather_forecast(location)
 
     except HTTPException:
         raise
